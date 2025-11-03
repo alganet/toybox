@@ -30,7 +30,7 @@
  * TODO: getuid() vs geteuid()
  * TODO: test that $PS1 color changes work without stupid \[ \] hack
  * TODO: Handle embedded NUL bytes in the command line? (When/how?)
- * TODO: set -e -o pipefail, shopt -s nullglob
+ * TODO: set -o pipefail, shopt -s nullglob
  * TODO: utf8 isspace
  *
  * bash man page:
@@ -488,6 +488,7 @@ static const char *redirectors[] = {"<<<", "<<-", "<<", "<&", "<>", "<", ">>",
 #define OPT_C	0x200
 #define OPT_x	0x400
 #define OPT_u	0x800
+#define OPT_e	0x1000
 
 // only export $PWD and $OLDPWD on first cd
 #define OPT_cd  0x80000000
@@ -3337,7 +3338,7 @@ if (DEBUG) dprintf(2, "%d %p(%d) %s word=%.*s\n", getpid(), pl, pl ? pl->type : 
         } else {
           // Add this alias to seen list and substitute into string.
           (al = xmalloc(sizeof(struct arg_list)))->next = aliseen;
-          al->arg = TT.alias.v[i];
+          al->arg = TT.alias.v[j];
           aliseen = al;
           start = end = xmprintf("%s%s", start, end);
           free(delete);
@@ -3897,6 +3898,29 @@ if (DEBUG) dprintf(2, "%d get_next_line=%s\n", getpid(), new ? : "(null)");
       when to auto-exec? ps vs sh -c 'ps' vs sh -c '(ps)'
 */
 
+// check if should exit and close source file if needed
+// returns 1 if errexit triggered and execution should stop
+static int handle_errexit(char *ctl)
+{
+  struct sh_blockstack *blk;
+
+  if (!(TT.options & OPT_e) || !toys.exitval) return 0;
+  if (ctl && (!strcmp(ctl, "&&") || !strcmp(ctl, "||"))) return 0;
+  if ((blk = TT.ff ? TT.ff->blk : 0) && blk->start && !blk->middle) {
+    char *keyword = *blk->start->arg->v;
+
+    if (!strcmp(keyword, "if") || !strcmp(keyword, "while") ||
+        !strcmp(keyword, "until")) return 0;
+  }
+
+  if (TT.ff && TT.ff->source) {
+    fclose(TT.ff->source);
+    TT.ff->source = 0;
+  }
+
+  return 1;
+}
+
 // run a parsed shell function. Handle flow control blocks and characters,
 // setup pipes and block redirection, break/continue, call builtins, functions,
 // vfork/exec external commands. Return when out of input.
@@ -3927,6 +3951,11 @@ static void run_lines(void)
       if (TT.ff->source) break;
       i = TT.ff->signal;
       end_fcall();
+      // check for errexit after function/source returns
+      if (!i && TT.ff && TT.ff->pl) {
+        ctl = TT.ff->pl->end->arg->v[TT.ff->pl->end->arg->c];
+        if (handle_errexit(ctl)) TT.ff->pl = 0;
+      }
 // TODO can we move advance logic to start of loop to avoid straddle?
       if (!i || !TT.ff || !TT.ff->pl) goto advance;
     }
@@ -4252,6 +4281,8 @@ do_then:
         if (dashi()) dprintf(2, "[%u] %u\n", pplist->job,pplist->pid);
       } else {
         toys.exitval = wait_pipeline(pplist);
+        // errexit: exit on error unless in exempt context
+        if (handle_errexit(ctl)) TT.ff->pl = 0;
         llist_traverse(pplist, (void *)free_process);
       }
       pplist = 0;
@@ -4584,15 +4615,15 @@ void alias_main(void)
     if (!(s = strchr(toys.optargs[i], '='))) {
       for (j = 0; j<TT.alias.c && (s = TT.alias.v[j]); j++)
         if (strstart(&s, toys.optargs[i]) && *s++=='=') break;
-      if (j==TT.alias.c) sherror_msg("%s: not found", TT.alias.v[j]);
-      else printf("alias %s=%s\n", TT.alias.v[j], s); // TODO $'escape'
+      if (j==TT.alias.c) sherror_msg("%s: not found", toys.optargs[i]);
+      else printf("alias %s=%s\n", toys.optargs[i], s); // TODO $'escape'
     } else {
-      for (i = 0; i<TT.alias.c; i++)
-        if (!memcmp(TT.alias.v[i], toys.optargs[i], s+1-toys.optargs[i])) break;
-      if (i==TT.alias.c) arg_add(&TT.alias, xstrdup(toys.optargs[i]));
+      for (j = 0; j<TT.alias.c; j++)
+        if (!memcmp(TT.alias.v[j], toys.optargs[i], s+1-toys.optargs[i])) break;
+      if (j==TT.alias.c) arg_add(&TT.alias, xstrdup(toys.optargs[i]));
       else {
-        free(toys.optargs[i]);
-        toys.optargs[i] = xstrdup(toys.optargs[i]);
+        free(TT.alias.v[j]);
+        TT.alias.v[j] = xstrdup(toys.optargs[i]);
       }
     }
   }
@@ -4695,8 +4726,8 @@ void exit_main(void)
 // lib/args.c can't +prefix & "+o history" needs space so parse cmdline here
 void set_main(void)
 {
-  char *cc, *ostr[] = {"braceexpand", "noclobber", "xtrace"};
-  int ii, jj, kk, oo = 0, dd = 0;
+  char *cc, *ostr[] = {"braceexpand", "noclobber", "xtrace", "unset", "errexit"};
+  int ii, jj, kk, oo = 0, dd = 0, odash = 0;
 
   // display visible variables
   if (!*toys.optargs) {
@@ -4715,7 +4746,7 @@ void set_main(void)
     if ((cc = toys.optargs[ii]) && !(dd = stridx("-+", *cc)+1) && oo--) {
       for (jj = 0; jj<ARRAY_LEN(ostr); jj++) if (!strcmp(cc, ostr[jj])) break;
       if (jj != ARRAY_LEN(ostr)) {
-        if (dd==1) TT.options |= OPT_B<<jj;
+        if (odash==1) TT.options |= OPT_B<<jj;
         else TT.options &= ~(OPT_B<<jj);
 
         continue;
@@ -4726,12 +4757,13 @@ void set_main(void)
       printf("%s\t%s\n", ostr[jj], TT.options&(OPT_B<<jj) ? "on" : "off");
     oo = 0;
     if (!cc || !dd) break;
+    odash = dd;
     for (jj = 1; cc[jj]; jj++) {
       if (cc[jj] == 'o') oo++;
-      else if (-1 != (kk = stridx("BCxu", cc[jj]))) {
+      else if (-1 != (kk = stridx("BCxue", cc[jj]))) {
         if (*cc == '-') TT.options |= OPT_B<<kk;
         else TT.options &= ~(OPT_B<<kk);
-      } else error_exit("bad -%c", toys.optargs[ii][1]);
+      } else error_exit("bad -%c", cc[jj]);
     }
   }
 
@@ -5057,7 +5089,20 @@ void shift_main(void)
 // TODO add tests: sh -c "source input four five" one two three
 void source_main(void)
 {
-  int ii;
+  struct sh_fcall *ff;
+  int ii, depth = 0;
+
+  // check for recursion: count how many source files are in the call stack
+  for (ff = TT.ff; ; ff = ff->next) {
+    if (ff->source) depth++;
+    if (ff->next == TT.ff) break;
+  }
+
+  if (depth >= 100) {
+    sherror_msg("recursive source");
+    toys.exitval = 1;
+    return;
+  }
 
   if (!(TT.ff->source = fpathopen(*toys.optargs)))
     return perror_msg_raw(*toys.optargs);

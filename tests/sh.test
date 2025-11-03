@@ -753,6 +753,49 @@ testing 'unalias' \
   $'alias abc=def\nalias | egrep -o \'(abc=|def)\'\nunalias abc\nalias' \
   'abc=\ndef\n' '' ''
 
+# set -e, set -o errexit
+testing 'errexit simple' \
+  'set -e; false; echo after' '' '' ''
+testing 'errexit full' \
+  'set -o errexit; false; echo after' '' '' ''
+testing 'errexit in &&' \
+  'set -e; false && echo after' '' '' ''
+testing 'errexit in ||' \
+  'set -e; false || echo after' 'after\n' '' ''
+testing 'errexit in if' \
+  'set -e; if false; then echo in; fi; echo after' 'after\n' '' ''
+testing 'errexit in while' \
+  'set -e; while false; do echo in; done; echo after' 'after\n' '' ''
+testing 'errexit in background &' \
+  'set -e; false & echo after' 'after\n' '' ''
+testing 'errexit negated !' \
+  'set -e; ! false; echo after' 'after\n' '' ''
+testing 'errexit in braces' \
+  'set -e; { false; }; echo after' '' '' ''
+testing 'errexit in command substitution' \
+  'set -e; : $(false); echo after' 'after\n' '' ''
+testing 'errexit in subshell' \
+  'set -e; (false); echo after' '' '' ''
+testing 'errexit in pipe (no pipefail)' \
+  'set -e; false | echo after' 'after\n' '' ''
+testing 'errexit in pipe last (no pipefail)' \
+  'set -e; echo before | false' '' '' ''
+testing 'errexit in function calls' \
+  'set -e; f() { false; }; f; echo after' '' '' ''
+testing 'errexit can be disabled' \
+  'set -e; false || : ; set +e; false; echo after2' 'after2\n' '' ''
+echo 'set -e; false; echo inside' > input_err
+testing "errexit on . included files" \
+  '. ./input_err; echo after' '' '' ''
+rm input_err
+# Do not shorten this test to use `;`, it is testing new lines specifically.
+echo 'echo line1
+false
+echo line2' > script_err
+testing 'errexit stops script execution' \
+  'set -e; . ./script_err; echo after' 'line1\n' '' ''
+rm script_err
+
 
 # TODO finish variable list from shell init
 
